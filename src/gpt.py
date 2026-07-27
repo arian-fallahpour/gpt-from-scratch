@@ -190,14 +190,10 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
         optimizer.zero_grad()  # Start each epoch with a clean gradient buffer
 
         for i, (input_batch, target_batch) in enumerate(train_loader):
-            # Scale down so the accumulated gradients average - rather than sum -
-            # over the micro-batches making up one effective batch
             loss = calc_loss_batch(input_batch, target_batch, model, device) / accumulation_steps
             loss.backward()  # Accumulate loss gradients into .grad
             tokens_seen += input_batch.numel()
 
-            # Keep accumulating until we have a full effective batch (or hit the
-            # end of the epoch, where we flush whatever is left over)
             is_last_batch = (i + 1) == num_batches
             if (i + 1) % accumulation_steps != 0 and not is_last_batch:
                 continue
@@ -238,9 +234,6 @@ def generate_and_print_sample(model, tokenizer, device, start_context,
     context_size = model.pos_emb.weight.shape[0]
     encoded = text_to_token_ids(start_context, tokenizer).to(device)
     with torch.no_grad():
-        # Sample rather than take the argmax: greedy decoding on a model this small
-        # collapses into a repeated phrase regardless of how well training went, which
-        # makes the progress printout useless as a diagnostic.
         token_ids = generate(
             model=model, idx=encoded,
             max_new_tokens=50, context_size=context_size,
