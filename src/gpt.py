@@ -1,3 +1,6 @@
+import contextlib
+import math
+
 import torch
 import numpy as np
 
@@ -137,12 +140,24 @@ class GPTModel(torch.nn.Module):
     
 
 def generate(model, idx,
-             max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+             max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None,
+             repetition_penalty=1.0):
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
         with torch.no_grad():
             logits = model(idx_cond)
         logits = logits[:, -1, :]
+
+        # Damp tokens that already appeared so the model stops looping a hook forever.
+        # Dividing only demotes a token when its logit is positive, so negatives are
+        # multiplied instead (the CTRL formulation).
+        if repetition_penalty != 1.0:
+            for row in range(idx.shape[0]):
+                seen = torch.unique(idx[row])
+                scores = logits[row, seen]
+                logits[row, seen] = torch.where(
+                    scores > 0, scores / repetition_penalty, scores * repetition_penalty
+                )
 
         if top_k is not None:
             top_logits, _ = torch.topk(logits, top_k)
@@ -176,13 +191,27 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
         idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
     return idx
 
+def lr_at_step(step, total_steps, peak_lr, min_lr, warmup_steps):
+    """Linear warmup to peak_lr, then cosine decay down to min_lr."""
+    if step < warmup_steps:
+        return peak_lr * (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(progress, 1.0)
+    return min_lr + 0.5 * (peak_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
 def train_model_simple(model, train_loader, val_loader, optimizer, device, num_epochs,
                        eval_freq, eval_iter, start_context, tokenizer,
-                       accumulation_steps=1):
+                       accumulation_steps=1, peak_lr=None, min_lr=0.0,
+                       warmup_frac=0.1, max_grad_norm=None):
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
     num_batches = len(train_loader)
+
+    # Scheduling works in optimizer steps, not micro-batches
+    total_steps = math.ceil(num_batches / accumulation_steps) * num_epochs
+    warmup_steps = max(1, int(total_steps * warmup_frac))
 
     # Main training loop
     for epoch in range(num_epochs):
@@ -197,6 +226,16 @@ def train_model_simple(model, train_loader, val_loader, optimizer, device, num_e
             is_last_batch = (i + 1) == num_batches
             if (i + 1) % accumulation_steps != 0 and not is_last_batch:
                 continue
+
+            if peak_lr is not None:
+                # global_step is only bumped after the update, so the step about to
+                # run is global_step + 1
+                lr = lr_at_step(global_step + 1, total_steps, peak_lr, min_lr, warmup_steps)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
+
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
             optimizer.step()  # Update model weights using the accumulated gradients
             optimizer.zero_grad()  # Reset gradients for the next effective batch
@@ -228,8 +267,158 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
     model.train()
     return train_loss, val_loss
 
+
+def evaluate_model_amp(model, train_loader, val_loader, device, eval_iter,
+                       val_iter=None, amp_dtype=None):
+    """Copy of evaluate_model that runs under autocast and can use the whole val set.
+
+    val_iter=None walks every validation batch, which matters once the val loss is
+    what decides when to stop: a 20-batch sample of it is noisy enough to trigger
+    early stopping on measurement noise alone.
+    """
+    autocast = (torch.amp.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_dtype is not None else contextlib.nullcontext())
+    model.eval()
+    with torch.no_grad(), autocast:
+        train_loss = calc_loss_loader(train_loader, model, device, num_batches=eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, device, num_batches=val_iter)
+    model.train()
+    return train_loss, val_loss
+
+
+def decay_param_groups(model, weight_decay):
+    """Apply weight decay to matmul weights only, never to biases or LayerNorm gains.
+
+    Decaying a LayerNorm scale or a bias pulls it toward zero without any
+    regularizing benefit, and on a fine-tune that just erodes the pretrained
+    calibration.
+    """
+    decay, no_decay, seen = [], [], set()
+    for param in model.parameters():
+        if not param.requires_grad or id(param) in seen:
+            continue  # tok_emb and out_head are the same tensor once weights are tied
+        seen.add(id(param))
+        (decay if param.dim() >= 2 else no_decay).append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def train_model_finetune(model, train_loader, val_loader, optimizer, device, num_epochs,
+                         eval_freq, eval_iter, start_context, tokenizer,
+                         accumulation_steps=1, peak_lr=None, min_lr=0.0,
+                         warmup_frac=0.05, max_grad_norm=1.0, val_iter=None,
+                         use_amp=False, patience=None, min_delta=0.0):
+    """Copy of train_model_simple built for fine-tuning on a small dataset.
+
+    Three additions over the simple loop:
+      * fp16 autocast + gradient scaling. Most of the win is speed - Turing runs
+        fp16 matmuls at 2x. Memory moves less than it looks like it should,
+        because the cross-entropy over a 50k vocab is autocast back to fp32 and
+        that tensor dominates the peak;
+      * the best-so-far weights are kept and restored at the end, so the returned
+        model is the one at the val-loss minimum rather than whatever the last
+        step produced;
+      * early stopping, so the run ends on its own once val loss stops improving
+        instead of needing the epoch count guessed in advance.
+    """
+    train_losses, val_losses, track_tokens_seen = [], [], []
+    tokens_seen, global_step = 0, -1
+    num_batches = len(train_loader)
+
+    # Scheduling works in optimizer steps, not micro-batches
+    total_steps = math.ceil(num_batches / accumulation_steps) * num_epochs
+    warmup_steps = max(1, int(total_steps * warmup_frac))
+
+    # fp16 only pays off on CUDA; on CPU/MPS this degrades to a plain fp32 run
+    amp_dtype = torch.float16 if (use_amp and device.type == "cuda") else None
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype is not None)
+
+    def autocast():
+        return (torch.amp.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_dtype is not None else contextlib.nullcontext())
+
+    best_val_loss = float("inf")
+    best_state, best_step = None, -1
+    evals_without_improvement = 0
+    stop_early = False
+
+    for epoch in range(num_epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        for i, (input_batch, target_batch) in enumerate(train_loader):
+            with autocast():
+                loss = calc_loss_batch(input_batch, target_batch, model, device) / accumulation_steps
+            scaler.scale(loss).backward()  # no-op scaling when AMP is off
+            tokens_seen += input_batch.numel()
+
+            is_last_batch = (i + 1) == num_batches
+            if (i + 1) % accumulation_steps != 0 and not is_last_batch:
+                continue
+
+            if peak_lr is not None:
+                # global_step is only bumped after the update, so the step about to
+                # run is global_step + 1
+                lr = lr_at_step(global_step + 1, total_steps, peak_lr, min_lr, warmup_steps)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = lr
+
+            if max_grad_norm is not None:
+                # Gradients are still scaled at this point, so undo that before
+                # clipping or the norm threshold means nothing
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+            scaler.step(optimizer)  # skipped automatically if the step overflowed
+            scaler.update()
+            optimizer.zero_grad()
+            global_step += 1
+
+            if global_step % eval_freq == 0:
+                train_loss, val_loss = evaluate_model_amp(
+                    model, train_loader, val_loader, device, eval_iter,
+                    val_iter=val_iter, amp_dtype=amp_dtype)
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+                track_tokens_seen.append(tokens_seen)
+
+                improved = val_loss < best_val_loss - min_delta
+                if improved:
+                    best_val_loss, best_step = val_loss, global_step
+                    # Park the snapshot on the CPU; a second copy of the model does
+                    # not fit next to the optimizer state in 4 GB of VRAM
+                    best_state = {k: v.detach().to("cpu", copy=True)
+                                  for k, v in model.state_dict().items()}
+                    evals_without_improvement = 0
+                else:
+                    evals_without_improvement += 1
+
+                print(f"Ep {epoch+1} (Step {global_step:06d}): "
+                      f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}"
+                      f"{' *' if improved else ''}")
+
+                if patience is not None and evals_without_improvement >= patience:
+                    print(f"Early stop: no val improvement for {patience} evaluations "
+                          f"(best {best_val_loss:.3f} at step {best_step}).")
+                    stop_early = True
+                    break
+
+        generate_and_print_sample(model, tokenizer, device, start_context)
+
+        if stop_early:
+            break
+
+    if best_state is not None:
+        # Whatever the last step left behind is past the val minimum; roll back
+        model.load_state_dict(best_state)
+        print(f"Restored best weights from step {best_step} (val loss {best_val_loss:.3f}).")
+
+    return train_losses, val_losses, track_tokens_seen, best_val_loss
+
 def generate_and_print_sample(model, tokenizer, device, start_context,
-                              temperature=0.9, top_k=50):
+                              temperature=0.9, top_k=50, repetition_penalty=1.15):
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
     encoded = text_to_token_ids(start_context, tokenizer).to(device)
@@ -237,7 +426,8 @@ def generate_and_print_sample(model, tokenizer, device, start_context,
         token_ids = generate(
             model=model, idx=encoded,
             max_new_tokens=50, context_size=context_size,
-            temperature=temperature, top_k=top_k, eos_id=50256
+            temperature=temperature, top_k=top_k, eos_id=50256,
+            repetition_penalty=repetition_penalty
         )
         decoded_text = token_ids_to_text(token_ids, tokenizer)
         print(decoded_text.replace("\n", " "))  # Compact print format

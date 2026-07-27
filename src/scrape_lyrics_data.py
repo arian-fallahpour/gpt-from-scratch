@@ -13,6 +13,8 @@
 # copyrighted lyrics as local training data only.
 #########################################################
 
+
+# 
 import argparse
 import json
 import os
@@ -407,12 +409,13 @@ def scrape(titles, artist_name, delay, cache_path, source, workers):
     blocked = threading.Event()
 
     results = [None] * len(titles)
-    done = [0]
+    skipped = [0]
 
-    def report(title, status):
+    def log(index, title, status):
+        """Every line for a song carries that song's position, so its 'fetching' line and
+        its result line share a number even though workers finish out of order."""
         with lock:
-            done[0] += 1
-            print(f"[{done[0]}/{len(titles)}] {title} ... {status}", flush=True)
+            print(f"[{index + 1}/{len(titles)}] {title} ... {status}", flush=True)
 
     def work(index, title):
         with lock:
@@ -421,53 +424,51 @@ def scrape(titles, artist_name, delay, cache_path, source, workers):
         if cached is not None:
             # Re-clean: the cache may predate the current stripping rules
             results[index] = clean_lyrics(cached)
-            report(title, f"cached ({len(results[index])} chars)")
+            log(index, title, f"cached ({len(results[index])} chars)")
             return
 
         if blocked.is_set():
-            return  # another worker hit the captcha; don't keep hammering
+            # Another worker hit the captcha; don't keep hammering, and don't log one
+            # line per remaining song either — at 500 titles that buries the real error.
+            with lock:
+                skipped[0] += 1
+            return
 
         if not hasattr(local, "session"):
             local.session = make_session(source)
+
+        # A fetch waits `delay` seconds or more, so log the song before it starts
+        log(index, title, "fetching")
 
         try:
             lyrics = fetch_lyrics(title, artist_name, local.session, delay, source)
         except BlockedError:
             blocked.set()
+            log(index, title, "blocked (captcha)")
             return
         except requests.RequestException as error:
             # One bad response shouldn't abandon the other 199 songs
-            report(title, f"failed ({type(error).__name__})")
+            log(index, title, f"failed ({type(error).__name__})")
             return
 
         if not lyrics:
-            report(title, f"not found on {source}")
+            log(index, title, f"not found on {source}")
             return
 
         results[index] = lyrics
         with lock:
             cache[title] = lyrics
             save_cache(cache_path, cache)
-        report(title, f"scraped ({len(lyrics)} chars)")
+        log(index, title, f"scraped ({len(lyrics)} chars)")
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for _ in pool.map(work, range(len(titles)), titles):
             pass
 
-    entries, missing, seen_lyrics = [], [], set()
-    for title, lyrics in zip(titles, results):
-        # Two title variants can resolve to the same lyrics page, so keep the text unique
-        if not lyrics:
-            missing.append(title)
-        elif lyrics not in seen_lyrics:
-            seen_lyrics.add(lyrics)
-            entries.append({"instruction": "", "input": "", "output": lyrics})
-
-    return entries, missing, blocked.is_set()
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    if skipped[0]:
+        print(f"\n{skipped[0]} songs not attempted after the block", file=sys.stderr)
+          pass
+r = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artist", default="Drake")
     parser.add_argument(
         "--output",
