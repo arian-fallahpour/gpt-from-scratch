@@ -5,7 +5,6 @@ import tiktoken
 import torch
 import time
 import re
-import random
 
 from torch.utils.data import Dataset, DataLoader
 from utils import (
@@ -83,15 +82,12 @@ class InstructionDataset(Dataset):
         return len(self.data)
 
 # Gather data and set it up for training, testing and validation
-file_path = "data/instruction-data-lyrics-large-large.json"
+file_path = "data/instruction-data-basic.json"
 url = (
     "https://raw.githubusercontent.com/rasbt/LLMs-from-scratch"
     "/main/ch07/01_main-chapter-code/instruction-data.json"
 )
 data = download_and_load_file(file_path, url)
-
-random.seed(123)
-random.shuffle(data)
 
 train_portion = int(len(data) * 0.85)  # 85% for training
 test_portion = int(len(data) * 0.1)    # 10% for testing
@@ -108,13 +104,12 @@ print("Device:", device)
 
 # Model configuration
 num_workers = 0
-batch_size = 1           # micro-batch that fits in memory (355M needs more headroom per sample than 124M)
-accumulation_steps = 16  # effective batch size = batch_size * accumulation_steps
+batch_size = 8
 
 CONFIG = {
     "vocab_size": 50257,
     "context_length": 1024,
-    "drop_rate": 0.05,
+    "drop_rate": 0.0,
     "qkv_bias": True,
 }
 model_configs = {
@@ -129,7 +124,7 @@ CONFIG.update(model_configs[CHOOSE_MODEL])
 model_size = CHOOSE_MODEL.split(" ")[-1].lstrip("(").rstrip(")")
 model = GPTModel(CONFIG)
 
-settings, params = download_and_load_gpt2(model_size=model_size, models_dir="gpt2")
+settings, params = download_and_load_gpt2(model_size=model_size,models_dir="gpt2")
 load_weights_into_gpt(model, params)
 model.eval()
 
@@ -139,7 +134,7 @@ train_dataset = InstructionDataset(train_data, tokenizer)
 train_loader = DataLoader(
     train_dataset,
     batch_size=batch_size,
-    collate_fn=customized_collate,
+    collate_fn=collate,
     shuffle=True,
     drop_last=True,
     num_workers=num_workers
@@ -175,15 +170,13 @@ print("Validation loss:", val_loss)
 
 # Training process
 start_time = time.time()
-learning_rate = 0.00002
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.1)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.00005, weight_decay=0.1)
 
 num_epochs = 2
 train_losses, val_losses, tokens_seen = train_model_simple(
     model, train_loader, val_loader, optimizer, device,
-    num_epochs=num_epochs, eval_freq=5, eval_iter=10,
-    start_context=format_input(val_data[1]), tokenizer=tokenizer,
-    accumulation_steps=accumulation_steps
+    num_epochs=num_epochs, eval_freq=5, eval_iter=5,
+    start_context=format_input(val_data[0]), tokenizer=tokenizer
 )
 
 end_time = time.time()
@@ -191,8 +184,7 @@ execution_time_minutes = (end_time - start_time) / 60
 print(f"Training completed in {execution_time_minutes:.2f} minutes.")
 
 # Save the model before plotting, since plot_losses blocks on an interactive window
-print("Starting model save process...")
-file_name = os.path.join("data", f"{re.sub(r"[ ()]", "", CHOOSE_MODEL)}-lyrics-sft.pth")
+file_name = os.path.join("data", f"{re.sub(r"[ ()]", "", CHOOSE_MODEL)}-sft.pth")
 save_checkpoint(model.state_dict(), file_name)
 print(f"Model saved as {file_name}")
 

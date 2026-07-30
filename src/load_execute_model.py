@@ -19,6 +19,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DEFAULT_MODEL = "gpt2-medium355M-sft.pth"
 EOS_ID = 50256
+NEWLINE_TOKEN_IDS = {198, 628}  # '\n', '\n\n' — must stay free to recur under repetition_penalty
 
 model_configs = {
     "gpt2-small (124M)": {"emb_dim": 768, "num_layers": 12, "num_heads": 12},
@@ -29,9 +30,7 @@ model_configs = {
 # The checkpoint tells us the size, so look the rest of the architecture up by emb_dim
 configs_by_emb_dim = {config["emb_dim"]: (name, config) for name, config in model_configs.items()}
 
-# The prompt header has to match the fine-tune's training script character for
-# character (including the "taks" typo in the basic run), since that is the only
-# prompt shape the model ever saw.
+
 PROMPT_STYLES = {
     "lyrics": {
         "header": (
@@ -41,8 +40,6 @@ PROMPT_STYLES = {
         "temperature": 0.8,
         "top_k": 50,
         "max_new_tokens": 300,
-        # Choruses repeat in the training data, so without this the model happily
-        # loops one hook until it hits max_new_tokens
         "repetition_penalty": 1.15,
     },
     "instruction": {
@@ -104,7 +101,20 @@ def split_prompt(line):
     return instruction.strip(), input_text.strip()
 
 def load_model(checkpoint, device):
-    state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
+    try:
+        state_dict = torch.load(checkpoint, map_location=device, weights_only=True)
+    except RuntimeError as error:
+        # A save that was interrupted still leaves a structurally valid zip, so the
+        # missing tensors only show up here as a stream-reader failure
+        if "failed locating file" not in str(error):
+            raise
+        size_mb = os.path.getsize(checkpoint) / 1024 ** 2
+        raise SystemExit(
+            f"Checkpoint is incomplete: {checkpoint} ({size_mb:.0f} MB)\n\n"
+            f"It is missing most of its tensors, which happens when the save that "
+            f"produced it was interrupted. The weights cannot be recovered from the "
+            f"file; delete it and re-run the fine-tune script that writes it."
+        ) from error
 
     emb_dim = state_dict["tok_emb.weight"].shape[1]
     if emb_dim not in configs_by_emb_dim:
@@ -136,6 +146,7 @@ def respond(model, tokenizer, settings, config, device, prompt):
         top_k=settings["top_k"],
         eos_id=EOS_ID,
         repetition_penalty=settings.get("repetition_penalty", 1.0),
+        repetition_penalty_exclude=NEWLINE_TOKEN_IDS,
     )
     generated_text = token_ids_to_text(token_ids, tokenizer)
 
